@@ -2,8 +2,13 @@ name: OCI A1 retry
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # every 10 min (GitHub may delay a few minutes)
+    - cron: "*/5 * * * *"    # every 5 min (GitHub may delay a few minutes)
   workflow_dispatch:          # lets you run it manually from the Actions tab
+
+# Never run two attempts at the same time (prevents creating 2 instances)
+concurrency:
+  group: oci-a1-retry
+  cancel-in-progress: false
 
 jobs:
   try-launch:
@@ -11,11 +16,11 @@ jobs:
     timeout-minutes: 10
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
-      OCPUS: "2"
-      MEMORY_GB: "12"
       BOOT_GB: "100"
       SUBNET_NAME: "subnet-publica-kucha"
       INSTANCE_NAME: "eita"
+      # Shapes to try, in order: "OCPUs:MemoryGB". Bigger first, smaller as fallback.
+      SHAPES: "2:12 1:6"
 
     steps:
       - name: Install OCI CLI
@@ -82,20 +87,23 @@ jobs:
             exit 1
           fi
 
-          # 3. Try every AD once
+          # 3. Try every AD, each with the big shape first, then the small one
           for AD in $ADS; do
-            echo "Trying $AD ..."
-            if oci --no-retry compute instance launch -c "$C" --availability-domain "$AD" \
-                --shape VM.Standard.A1.Flex \
-                --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
-                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-                --display-name "$INSTANCE_NAME" --boot-volume-size-in-gbs "$BOOT_GB" \
-                --ssh-authorized-keys-file ~/key.pub > out.json 2> err.txt; then
-              notify "Oracle A1 instance created in $AD! Go grab the public IP and disable the GitHub workflow."
-              exit 0
-            fi
-            grep -o '"message": "[^"]*"' err.txt | head -1 || tail -3 err.txt
-            sleep 5
+            for S in $SHAPES; do
+              OCPUS=${S%%:*}; MEM=${S##*:}
+              echo "Trying $AD with ${OCPUS} OCPU / ${MEM} GB ..."
+              if oci --no-retry compute instance launch -c "$C" --availability-domain "$AD" \
+                  --shape VM.Standard.A1.Flex \
+                  --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEM}" \
+                  --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                  --display-name "$INSTANCE_NAME" --boot-volume-size-in-gbs "$BOOT_GB" \
+                  --ssh-authorized-keys-file ~/key.pub > out.json 2> err.txt; then
+                notify "Oracle A1 instance created in $AD (${OCPUS} OCPU / ${MEM} GB)! Grab the public IP and disable the GitHub workflow."
+                exit 0
+              fi
+              grep -o '"message": "[^"]*"' err.txt | head -1 || tail -3 err.txt
+              sleep 3
+            done
           done
 
           echo "No capacity this round. Will try again on the next schedule."
