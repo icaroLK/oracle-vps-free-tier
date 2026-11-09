@@ -1,0 +1,102 @@
+name: OCI A1 retry
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # every 10 min (GitHub may delay a few minutes)
+  workflow_dispatch:          # lets you run it manually from the Actions tab
+
+jobs:
+  try-launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      OCPUS: "2"
+      MEMORY_GB: "12"
+      BOOT_GB: "100"
+      SUBNET_NAME: "subnet-publica-kucha"
+      INSTANCE_NAME: "eita"
+
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Write OCI config
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=~/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/config
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/key.pub
+
+      - name: Try to launch A1 instance
+        env:
+          C: ${{ secrets.OCI_TENANCY }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          notify() {
+            echo "$1"
+            if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+              curl -s -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+                -d chat_id="$TG_CHAT" -d text="$1" > /dev/null
+            fi
+          }
+
+          # 1. Stop if an A1 instance already exists (avoids going over the free limit)
+          EXISTING=$(oci compute instance list -c "$C" --all 2>/dev/null \
+            | jq '[.data[]? | select(.shape=="VM.Standard.A1.Flex" and ."lifecycle-state"!="TERMINATED")] | length')
+          EXISTING=${EXISTING:-0}
+          if [ "$EXISTING" -gt 0 ]; then
+            echo "An A1 instance already exists. Nothing to do. Disable this workflow."
+            exit 0
+          fi
+
+          # 2. Look up subnet, image and availability domains
+          SUBNET=$(oci network subnet list -c "$C" --display-name "$SUBNET_NAME" | jq -r '.data[0].id')
+          IMAGE=$(oci compute image list -c "$C" --operating-system "Canonical Ubuntu" \
+            --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --all \
+            | jq -r '[.data[] | select(."display-name" | test("24\\.04-(Minimal-)?aarch64"))][0].id')
+          ADS=$(oci iam availability-domain list -c "$C" | jq -r '.data[].name')
+
+          echo "Subnet: $SUBNET"
+          echo "Image:  $IMAGE"
+          echo "ADs:    $ADS"
+          if [ -z "$SUBNET" ] || [ "$SUBNET" = "null" ] || [ -z "$IMAGE" ] || [ "$IMAGE" = "null" ]; then
+            echo "Could not find subnet or image. Check the names."
+            exit 1
+          fi
+
+          # 3. Try every AD once
+          for AD in $ADS; do
+            echo "Trying $AD ..."
+            if oci compute instance launch -c "$C" --availability-domain "$AD" \
+                --shape VM.Standard.A1.Flex \
+                --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
+                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                --display-name "$INSTANCE_NAME" --boot-volume-size-in-gbs "$BOOT_GB" \
+                --ssh-authorized-keys-file ~/key.pub > out.json 2> err.txt; then
+              notify "Oracle A1 instance created in $AD! Go grab the public IP and disable the GitHub workflow."
+              exit 0
+            fi
+            grep -o '"message": "[^"]*"' err.txt | head -1 || tail -3 err.txt
+            sleep 5
+          done
+
+          echo "No capacity this round. Will try again on the next schedule."
+          exit 0
