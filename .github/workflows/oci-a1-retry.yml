@@ -85,7 +85,7 @@ jobs:
           # 3. Try every AD once
           for AD in $ADS; do
             echo "Trying $AD ..."
-            if oci compute instance launch -c "$C" --availability-domain "$AD" \
+            if oci --no-retry compute instance launch -c "$C" --availability-domain "$AD" \
                 --shape VM.Standard.A1.Flex \
                 --shape-config "{\"ocpus\":$OCPUS,\"memoryInGBs\":$MEMORY_GB}" \
                 --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
